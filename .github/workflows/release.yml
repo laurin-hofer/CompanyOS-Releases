@@ -1,0 +1,305 @@
+name: CompanyOS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Vorbereitete CompanyOS-Version (z. B. 1.0.10)
+        required: true
+        type: string
+
+# This workflow lives in the public distribution repository so standard
+# GitHub-hosted runners remain free. It is deliberately manual-only: public
+# pull requests and arbitrary pushes must never receive the private source key.
+permissions:
+  contents: write
+
+concurrency:
+  group: companyos-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build ${{ matrix.label }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Universal
+            platform: macos-latest
+            args: --target universal-apple-darwin
+          - label: Windows x64
+            platform: windows-latest
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    env:
+      RELEASE_TAG: v${{ inputs.version }}
+      RELEASE_REPO_TOKEN: ${{ github.token }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
+      VITE_BILLING_API_URL: "${{ secrets.VITE_SUPABASE_URL }}/functions/v1/billing"
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+
+    steps:
+      - name: Versionseingabe prüfen
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Ungültige Version: $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Privaten Quellcode am unveränderlichen Tag auschecken
+        uses: actions/checkout@v4
+        with:
+          repository: laurin-hofer/CompanyOS
+          ref: refs/tags/v${{ inputs.version }}
+          ssh-key: ${{ secrets.COMPANYOS_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Tag und Quellversion prüfen
+        shell: bash
+        run: |
+          APP_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          test "$APP_VERSION" = "${{ inputs.version }}"
+
+      - name: Node.js einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Rust einrichten
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Release-Umgebung prüfen
+        run: node scripts/verify-release-env.mjs
+
+      - name: Abhängigkeiten installieren
+        run: npm ci
+
+      - name: Lokale KI-Laufzeit bereitstellen
+        if: runner.os == 'Windows'
+        run: npm run engine:fetch
+
+      - name: Lokale KI-Laufzeit prüfen
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          engine="src-tauri/engine/windows-x64"
+          test -f "$engine/llama-server.exe" || { echo "llama-server.exe fehlt" >&2; exit 1; }
+          test -f "$engine/llama-server-impl.dll" || { echo "llama-server-impl.dll fehlt" >&2; exit 1; }
+          test -f "$engine/ggml-base.dll" || { echo "ggml-base.dll fehlt" >&2; exit 1; }
+          ls "$engine"/ggml-cpu-*.dll >/dev/null || { echo "kein ggml-CPU-Backend" >&2; exit 1; }
+
+      - name: Frontend- und Domänentests ausführen
+        run: npm test
+
+      - name: Native Funktionen testen
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Produktionsabhängigkeiten auf kritische Lücken prüfen
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Windows-Code-Signing-Zertifikat importieren
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERTIFICATE_PASSWORD != ''
+        shell: pwsh
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP "companyos-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          )
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password
+          if (-not $certificate.Thumbprint) {
+            throw "Windows-Code-Signing-Zertifikat konnte nicht importiert werden."
+          }
+          $tauriConfig = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $certificate.Thumbprint
+                digestAlgorithm = "sha256"
+                timestampUrl = "http://timestamp.digicert.com"
+              }
+            }
+          } | ConvertTo-Json -Compress -Depth 5
+          "TAURI_CONFIG=$tauriConfig" >> $env:GITHUB_ENV
+
+      - name: Updater und Installer bauen und hochladen
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          owner: laurin-hofer
+          repo: CompanyOS-Releases
+          releaseCommitish: main
+          tagName: v__VERSION__
+          releaseName: CompanyOS v__VERSION__
+          releaseBody: Automatisch erstelltes CompanyOS-Update für macOS und Windows.
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          uploadUpdaterSignatures: true
+          retryAttempts: 2
+          args: ${{ matrix.args }}
+
+      - name: macOS-Signatur und Notarisierung verifizieren
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' && env.APPLE_SIGNING_IDENTITY != '' && env.APPLE_ID != '' && env.APPLE_PASSWORD != '' && env.APPLE_TEAM_ID != ''
+        shell: bash
+        run: |
+          dmg=$(find src-tauri/target -path '*/bundle/dmg/*.dmg' -print -quit)
+          test -n "$dmg" || { echo "DMG fehlt" >&2; exit 1; }
+          spctl -a -vv -t open --context context:primary-signature "$dmg"
+          xcrun stapler validate "$dmg"
+
+      - name: Windows-Authenticode-Signatur verifizieren
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERTIFICATE_PASSWORD != ''
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path src-tauri/target -Recurse -Filter "*.exe" |
+            Where-Object { $_.FullName -match "bundle\\nsis" } |
+            Select-Object -First 1
+          if (-not $installer) { throw "NSIS-Installer fehlt." }
+          $signature = Get-AuthenticodeSignature $installer.FullName
+          if ($signature.Status -ne "Valid") {
+            throw "Windows-Installer ist nicht gültig signiert: $($signature.Status)"
+          }
+
+      - name: Fehlende Plattformsignierung dokumentieren
+        if: (runner.os == 'macOS' && env.APPLE_CERTIFICATE == '') || (runner.os == 'Windows' && env.WINDOWS_CERTIFICATE == '')
+        shell: bash
+        run: echo "${{ runner.os }}-Installer wird ohne optionale Plattformsignierung veröffentlicht; die Tauri-Updater-Signatur bleibt aktiv."
+
+  publish:
+    name: Release prüfen und veröffentlichen
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: v${{ inputs.version }}
+    steps:
+      - name: Privaten Quellcode am Release-Tag auschecken
+        uses: actions/checkout@v4
+        with:
+          repository: laurin-hofer/CompanyOS
+          ref: refs/tags/v${{ inputs.version }}
+          ssh-key: ${{ secrets.COMPANYOS_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Updater-Manifest validieren und Release veröffentlichen
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require("fs");
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.RELEASE_TAG;
+            const expectedVersion = JSON.parse(
+              fs.readFileSync("src-tauri/tauri.conf.json", "utf8"),
+            ).version;
+
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              { owner, repo, per_page: 100 },
+            );
+            const release = releases.find((candidate) => candidate.tag_name === tag);
+            if (!release) throw new Error(`Release ${tag} wurde nicht gefunden.`);
+            if (!release.draft) throw new Error(`Release ${tag} ist vor der Prüfung kein Entwurf mehr.`);
+
+            const assets = await github.paginate(
+              github.rest.repos.listReleaseAssets,
+              { owner, repo, release_id: release.id, per_page: 100 },
+            );
+            const updaterAsset = assets.find((asset) => asset.name === "latest.json");
+            if (!updaterAsset) throw new Error("latest.json fehlt im Release.");
+            if (!assets.some((asset) => asset.name.endsWith(".dmg"))) {
+              throw new Error("Der macOS-DMG-Installer fehlt.");
+            }
+            if (!assets.some((asset) => asset.name.endsWith(".msi") || asset.name.endsWith(".exe"))) {
+              throw new Error("Der Windows-Installer fehlt.");
+            }
+
+            const response = await github.request(
+              "GET /repos/{owner}/{repo}/releases/assets/{asset_id}",
+              {
+                owner,
+                repo,
+                asset_id: updaterAsset.id,
+                headers: { accept: "application/octet-stream" },
+              },
+            );
+            const manifest = typeof response.data === "string"
+              ? JSON.parse(response.data)
+              : response.data instanceof ArrayBuffer
+                ? JSON.parse(Buffer.from(response.data).toString("utf8"))
+                : response.data;
+            if (String(manifest.version).replace(/^v/, "") !== expectedVersion) {
+              throw new Error(`latest.json enthält Version ${manifest.version} statt ${expectedVersion}.`);
+            }
+
+            const assetNamesById = new Map(assets.map((asset) => [asset.id, asset.name]));
+            let rewritten = false;
+            for (const entry of Object.values(manifest.platforms ?? {})) {
+              const match = /\/assets\/(\d+)$/.exec(entry.url ?? "");
+              const assetName = match ? assetNamesById.get(Number(match[1])) : undefined;
+              if (assetName) {
+                entry.url = `https://github.com/${owner}/${repo}/releases/download/${tag}/${assetName}`;
+                rewritten = true;
+              }
+            }
+
+            const platformEntries = Object.entries(manifest.platforms ?? {});
+            for (const [label, matches] of [
+              ["macOS", (key) => key.startsWith("darwin-")],
+              ["Windows", (key) => key.startsWith("windows-")],
+            ]) {
+              const candidates = platformEntries.filter(([key]) => matches(key));
+              if (!candidates.some(([, entry]) =>
+                entry?.url?.startsWith(`https://github.com/${owner}/${repo}/releases/download/`) &&
+                entry?.signature
+              )) {
+                throw new Error(`latest.json enthält kein vollständiges Update für ${label}.`);
+              }
+            }
+
+            if (rewritten) {
+              await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: updaterAsset.id });
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id: release.id,
+                name: "latest.json",
+                data: JSON.stringify(manifest, null, 2),
+              });
+            }
+
+            await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: release.id,
+              draft: false,
+              prerelease: false,
+            });
+            core.notice(`CompanyOS ${expectedVersion} für macOS und Windows wurde veröffentlicht.`);
