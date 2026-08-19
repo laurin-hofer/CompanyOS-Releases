@@ -41,14 +41,10 @@ jobs:
       VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
       VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
       VITE_BILLING_API_URL: "${{ secrets.VITE_SUPABASE_URL }}/functions/v1/billing"
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_REQUESTED: ${{ secrets.APPLE_CERTIFICATE != '' || secrets.APPLE_CERTIFICATE_PASSWORD != '' || secrets.APPLE_SIGNING_IDENTITY != '' || secrets.APPLE_ID != '' || secrets.APPLE_PASSWORD != '' || secrets.APPLE_TEAM_ID != '' }}
+      APPLE_SIGNING_CONFIGURED: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+      WINDOWS_SIGNING_REQUESTED: ${{ secrets.WINDOWS_CERTIFICATE != '' || secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
+      WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
 
     steps:
       - name: Versionseingabe prüfen
@@ -116,9 +112,19 @@ jobs:
       - name: Produktionsabhängigkeiten auf kritische Lücken prüfen
         run: npm audit --omit=dev --audit-level=high
 
+      - name: Optionale Plattformsignierung prüfen
+        if: (runner.os == 'macOS' && env.APPLE_SIGNING_REQUESTED == 'true' && env.APPLE_SIGNING_CONFIGURED != 'true') || (runner.os == 'Windows' && env.WINDOWS_SIGNING_REQUESTED == 'true' && env.WINDOWS_SIGNING_CONFIGURED != 'true')
+        shell: bash
+        run: |
+          echo "Die optionale ${{ runner.os }}-Plattformsignierung ist nur teilweise konfiguriert." >&2
+          exit 1
+
       - name: Windows-Code-Signing-Zertifikat importieren
-        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERTIFICATE_PASSWORD != ''
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING_CONFIGURED == 'true'
         shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $certificatePath = Join-Path $env:RUNNER_TEMP "companyos-signing.pfx"
           [IO.File]::WriteAllBytes(
@@ -145,6 +151,7 @@ jobs:
           "TAURI_CONFIG=$tauriConfig" >> $env:GITHUB_ENV
 
       - name: Updater und Installer bauen und hochladen
+        if: runner.os != 'macOS' || env.APPLE_SIGNING_CONFIGURED != 'true'
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -163,8 +170,34 @@ jobs:
           retryAttempts: 2
           args: ${{ matrix.args }}
 
+      - name: Signierten macOS-Updater und Installer bauen und hochladen
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_CONFIGURED == 'true'
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          owner: laurin-hofer
+          repo: CompanyOS-Releases
+          releaseCommitish: main
+          tagName: v__VERSION__
+          releaseName: CompanyOS v__VERSION__
+          releaseBody: Automatisch erstelltes CompanyOS-Update für macOS und Windows.
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          uploadUpdaterSignatures: true
+          retryAttempts: 2
+          args: ${{ matrix.args }}
+
       - name: macOS-Signatur und Notarisierung verifizieren
-        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' && env.APPLE_SIGNING_IDENTITY != '' && env.APPLE_ID != '' && env.APPLE_PASSWORD != '' && env.APPLE_TEAM_ID != ''
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_CONFIGURED == 'true'
         shell: bash
         run: |
           dmg=$(find src-tauri/target -path '*/bundle/dmg/*.dmg' -print -quit)
@@ -173,7 +206,7 @@ jobs:
           xcrun stapler validate "$dmg"
 
       - name: Windows-Authenticode-Signatur verifizieren
-        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERTIFICATE_PASSWORD != ''
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING_CONFIGURED == 'true'
         shell: pwsh
         run: |
           $installer = Get-ChildItem -Path src-tauri/target -Recurse -Filter "*.exe" |
@@ -186,7 +219,7 @@ jobs:
           }
 
       - name: Fehlende Plattformsignierung dokumentieren
-        if: (runner.os == 'macOS' && env.APPLE_CERTIFICATE == '') || (runner.os == 'Windows' && env.WINDOWS_CERTIFICATE == '')
+        if: (runner.os == 'macOS' && env.APPLE_SIGNING_CONFIGURED != 'true') || (runner.os == 'Windows' && env.WINDOWS_SIGNING_CONFIGURED != 'true')
         shell: bash
         run: echo "${{ runner.os }}-Installer wird ohne optionale Plattformsignierung veröffentlicht; die Tauri-Updater-Signatur bleibt aktiv."
 
