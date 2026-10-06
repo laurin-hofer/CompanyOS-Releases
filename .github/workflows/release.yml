@@ -98,7 +98,6 @@ jobs:
           npm ci --prefix server
 
       - name: Lokale KI-Laufzeit bereitstellen
-        if: runner.os == 'Windows'
         run: npm run engine:fetch
 
       - name: Lokale KI-Laufzeit prüfen
