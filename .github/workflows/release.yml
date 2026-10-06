@@ -92,8 +92,10 @@ jobs:
       - name: Release-Umgebung prüfen
         run: node scripts/verify-release-env.mjs
 
-      - name: Abhängigkeiten installieren
-        run: npm ci
+      - name: App- und Test-Abhängigkeiten installieren
+        run: |
+          npm ci
+          npm ci --prefix server
 
       - name: Lokale KI-Laufzeit bereitstellen
         if: runner.os == 'Windows'
